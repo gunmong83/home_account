@@ -158,7 +158,7 @@ def parse_html(path: str, owner: Optional[str] = None) -> List[Dict[str, Any]]:
 
 # --- Points Parsing ---
 POINT_ITEM_RE = re.compile(r'class="PointsHistoryItem_article___qs8W[^"]*"')
-POINT_DATE_RE = re.compile(r'class="PointsHistoryItem_date__[^"]*">.*?(\d{2}\.\d{2})</div>')
+POINT_DATE_RE = re.compile(r'class="PointsHistoryItem_date__[^"]*">.*?(\d{2}\.\d{2})</div>', re.DOTALL)
 POINT_TIME_RE = re.compile(r'class="blind">시간</span>\s*(\d{2}:\d{2})</span>')
 POINT_DESC_RE = re.compile(r'class="PointsHistoryItem_title__[^"]*"[^>]*>\s*(.*?)\s*(?:</span|</a>|<svg)', re.DOTALL)
 POINT_AMOUNT_RE = re.compile(r'class="PointsHistoryItem_price__[^"]*"[^>]*>\s*(.*?)\s*</strong>', re.DOTALL)
@@ -168,11 +168,10 @@ def parse_points_html(html: str, owner: Optional[str] = None) -> List[Dict[str, 
     year_match = re.search(r'전체\s*((?:20)?\d{2,4})\s*년', html)
     year_str = year_match.group(1) if year_match else "2026"
     
-    starts = [m.start() for m in POINT_DESC_RE.finditer(html)]
     items = []
     
-    item_marker = POINT_ITEM_RE
-    item_starts = [m.start() for m in item_marker.finditer(html)]
+    item_starts = [m.start() for m in POINT_ITEM_RE.finditer(html)]
+    date_markers = list(POINT_DATE_RE.finditer(html))
     
     for i, start in enumerate(item_starts):
         end = item_starts[i + 1] if i + 1 < len(item_starts) else len(html)
@@ -180,7 +179,7 @@ def parse_points_html(html: str, owner: Optional[str] = None) -> List[Dict[str, 
         
         # Find the closest date element before this item
         date_val = ""
-        for dm in list(POINT_DATE_RE.finditer(block)):
+        for dm in reversed(date_markers):
             if dm.start() < start:
                 date_val = dm.group(1)
                 break
@@ -189,7 +188,7 @@ def parse_points_html(html: str, owner: Optional[str] = None) -> List[Dict[str, 
         time_val = time_match.group(1) if time_match else ""
         
         desc_match = re.search(POINT_DESC_RE.pattern, block)
-        desc = desc_match.group(1) if desc_match else ""
+        desc = _clean_text(desc_match.group(1)) if desc_match else ""
         
         amount_match = re.search(POINT_AMOUNT_RE.pattern, block)
         amount_text = amount_match.group(1) if amount_match else ""
@@ -207,46 +206,16 @@ def parse_points_html(html: str, owner: Optional[str] = None) -> List[Dict[str, 
             "상태": "적립/사용",
             "금액": amount,
             "owner": owner or "unknown",
-        })
-
-    for i, start in enumerate(starts):
-        end = starts[i + 1] if i + 1 < len(starts) else len(html)
-        block = html[start:end]
-        
-        def first_match(p, t):
-            m = p.search(t)
-            return m.group(1).strip() if m else ""
-
-        date_val = ""
-        if not date_val:
-            # Date is outside the item block, find the last date header before this item
-            for dm in reversed(date_markers):
-                if dm.start() < start:
-                    date_val = dm.group(1)
-                    break
-
-        time_val = first_match(POINT_TIME_RE, block)
-        desc = _clean_text(first_match(POINT_DESC_RE, block))
-        amount_text = _clean_text(first_match(POINT_AMOUNT_RE, block))
-        amount = _normalize_amount(amount_text)
-
-        items.append({
-            "날짜": f"{datetime.now().year}-{date_val.replace('.', '-')}" if date_val else "",
-            "날짜_raw": date_val,
-            "시간": f"{time_val}:00" if time_val else "",
-            "상품명": desc,
-            "가맹점": desc,
-            "상태": "적립/사용",
-            "금액": amount if amount is not None else 0,
-            "owner": owner or "unknown",
             "source": "points",
             "method": "points"
         })
+
     return items
 
 # --- Money Parsing ---
 MONEY_ITEM_RE = re.compile(r'class="History_history__')
 MONEY_DATE_RE = re.compile(r'class="History_date__[^"]*">.*?(\d{2}\.\d{2}\.)')
+MONEY_YEAR_RE = re.compile(r'class="History_item-year__[^"]*">(\d{4})')
 MONEY_TIME_RE = re.compile(r'class="History_type-time__[^"]*">.*?(\d{2}:\d{2})')
 MONEY_TITLE_RE = re.compile(r'class="History_title__[^"]*">(?:<a[^>]*>)?\s*(.*?)\s*(?:<span|</a>|</strong>)', re.DOTALL)
 MONEY_TYPE_RE = re.compile(r'class="History_type-sub-title__[^"]*">\s*(.*?)\s*</span>', re.DOTALL)
@@ -257,11 +226,22 @@ def parse_money_html(html: str, owner: Optional[str] = None) -> List[Dict[str, A
     items = []
     
     date_markers = list(MONEY_DATE_RE.finditer(html))
+    year_markers = list(MONEY_YEAR_RE.finditer(html))
+    
+    # Default to current year if no year header found yet
+    base_year = datetime.now().year
 
     for i, start in enumerate(starts):
         end = starts[i + 1] if i + 1 < len(starts) else len(html)
         block = html[start:end]
         
+        # Update current year if a year marker appeared before this item
+        current_year = base_year
+        for ym in reversed(year_markers):
+            if ym.start() < start:
+                current_year = int(ym.group(1))
+                break
+
         current_date_val = ""
         for dm in reversed(date_markers):
             if dm.start() < start:
@@ -279,7 +259,7 @@ def parse_money_html(html: str, owner: Optional[str] = None) -> List[Dict[str, A
         amount = _normalize_amount(amount_text)
 
         items.append({
-            "날짜": f"{datetime.now().year}-{current_date_val.replace('.', '-').rstrip('-')}" if current_date_val else "",
+            "날짜": f"{current_year}-{current_date_val.replace('.', '-').rstrip('-')}" if current_date_val else "",
             "시간": f"{time_val}:00" if time_val else "",
             "상품명": title,
             "가맹점": title,
@@ -294,7 +274,20 @@ def parse_money_html(html: str, owner: Optional[str] = None) -> List[Dict[str, A
 # --- Main CLI ---
 
 def parse(path: str, owner: Optional[str] = None) -> List[Dict[str, Any]]:
-    # Redirect to specialized parsers if needed, but for now HTML parsing
+    if path.lower().endswith(".csv"):
+        items = []
+        with open(path, "r", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                # Ensure numeric fields are converted
+                if "금액" in row:
+                    try:
+                        row["금액"] = int(row["금액"])
+                    except: pass
+                if owner and "owner" not in row:
+                    row["owner"] = owner
+                items.append(row)
+        return items
     return parse_html(path, owner)
 
 if __name__ == "__main__":

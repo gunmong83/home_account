@@ -8,6 +8,11 @@ from typing import Dict, List, Optional, Tuple, Sequence
 DATE_RE = re.compile(r"(\d{4})[./-](\d{1,2})[./-](\d{1,2})")
 TIME_RE = re.compile(r"(\d{1,2}):(\d{2})(?::(\d{2}))?")
 
+SHINHAN_OWNER_MAP = {
+    "147*": "taewoo",
+    "6267": "taewoo",
+}
+
 def _read_xls_rows(path: str) -> Tuple[List[List[object]], Optional[int]]:
     try:
         import xlrd
@@ -77,10 +82,25 @@ def parse(path: str, owner: Optional[str] = "taewoo") -> List[Dict[str, object]]
         # Parse datetime
         # Shinhan date format in card.py was: 2026.01.23 10:29
         date_str = str(row_map.get("거래일", "")).strip()
+        # Handle both 2026.01.23 and 2026-01-23
+        date_str = date_str.replace(".", "-")
         try:
-            dt = datetime.strptime(date_str, "%Y.%m.%d %H:%M")
+            # Check if it has time
+            if " " in date_str:
+                dt = datetime.strptime(date_str, "%Y-%m-%d %H:%M")
+            else:
+                dt = datetime.strptime(date_str, "%Y-%m-%d")
         except ValueError:
             continue
+
+        # Try to determine owner from card number if not provided
+        row_owner = owner
+        card_info = str(row_map.get("이용카드", "")).strip()
+        if card_info:
+            for last4, o in SHINHAN_OWNER_MAP.items():
+                if last4 in card_info:
+                    row_owner = o
+                    break
 
         result.append({
             "날짜": dt.strftime("%Y-%m-%d"),
@@ -89,7 +109,8 @@ def parse(path: str, owner: Optional[str] = "taewoo") -> List[Dict[str, object]]
             "금액": amt,
             "매입구분": str(row_map.get("매입구분", "")).strip(),
             "취소상태": str(row_map.get("취소상태", "")).strip(),
-            "owner": owner,
+            "이용카드": card_info,
+            "owner": row_owner,
         })
 
     return result

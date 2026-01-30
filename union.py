@@ -23,6 +23,10 @@ ACCOUNTS = {
     "WOORI_TAEWOO": "우리은행태우",
     "WOORI_CHAEYOUNG": "우리은행채영",
     "HYUNDAI_CARD": "신용카드태우",
+    "HYUNDAI_CARD_TAEWOO": "신용카드태우",
+    "HYUNDAI_CARD_CHAEYOUNG": "신용카드채영",
+    "SHINHAN_CARD_TAEWOO": "신용카드태우",
+    "SHINHAN_CARD_CHAEYOUNG": "신용카드채영",
     "SHINHAN_CARD": "신용카드태우",
     "NAVERPAY_POINTS_TAEWOO": "네이버포인트",
     "NAVERPAY_MONEY_TAEWOO": "네이버머니",
@@ -131,6 +135,12 @@ TOPUP_PATTERNS = [
     r"네이버페이\s*충전|하나\(\d+\*+\d+\)",
 ]
 
+# Card/Bank generic keywords to ignore when picking Item label
+GENERIC_BANK_TERMS = {
+    "체크우리", "펌뱅킹", "타행건별", "오픈뱅킹", "체크", "출금", "입금", "대체", "인터넷", 
+    "모바일", "토스", "토스페이", "카카오페이", "네이버페이결제", "현금", "F/B 출금", "F/B 입금",
+    "타행대량", "계좌이체", "예금결산", "예금이자", "예금", "적요", "내용", "오픈",
+}
 NAVERPAY_BANK_KEYWORD = "네이버페이결제"
 
 NAME_OWNER_MAP = {
@@ -164,6 +174,7 @@ class Posting:
     occurred_at: datetime
     account: str
     amount: int
+    item: str = ""
     memo: str = ""
 
 
@@ -274,6 +285,16 @@ def _to_std_txn(row: Dict[str, Any], source: str, owner: str) -> Optional[StdTxn
     
     uid = make_uid(source, row_owner, dt.isoformat(), merchant, amount)
     
+    status = row.get("상태") or row.get("매입구분") or row.get("승인구분") or "posted"
+    if isinstance(status, str):
+        status = status.lower()
+        if "취소" in status or "canceled" in status:
+            status = "canceled"
+        else:
+            status = "posted"
+    else:
+        status = "posted"
+
     return StdTxn(
         txn_uid=uid,
         occurred_at=dt,
@@ -282,6 +303,7 @@ def _to_std_txn(row: Dict[str, Any], source: str, owner: str) -> Optional[StdTxn
         merchant=str(_clean_text(str(merchant))),
         description=str(_clean_text(str(desc))),
         amount=int(amount),
+        status=status,
         raw_ref=str(row)
     )
 
@@ -366,8 +388,30 @@ def enrich_with_onnuri(
 
 def build_postings(txns: List[StdTxn]) -> List[Posting]:
     postings: List[Posting] = []
-
     for t in txns:
+        # Pick a more descriptive item label
+        item = t.merchant or t.description or "미분류"
+        
+        # If current item is a generic term, try to find something better in description
+        if any(item == term for term in GENERIC_BANK_TERMS) or not t.merchant:
+            if t.description:
+                item = t.description
+        
+        # Aggressively strip generic terms from the start
+        # e.g. "펌뱅킹 네이버페이결제 아씨방가구" -> "네이버페이결제 아씨방가구" -> "아씨방가구"
+        changed = True
+        while changed:
+            changed = False
+            for term in sorted(GENERIC_BANK_TERMS, key=len, reverse=True):
+                if item.startswith(term):
+                    candidate = item[len(term):].strip()
+                    if candidate:
+                        item = candidate
+                        changed = True
+                        break
+        
+        # Early category picking to ensure it's available for all sources
+        cat_acc = pick_category(t.merchant, t.description)
         memo = f"{t.source}/{t.owner} {t.merchant} {t.description}".strip()
 
         if t.source == "bank":
@@ -381,8 +425,8 @@ def build_postings(txns: List[StdTxn]) -> List[Posting]:
                 if NAVERPAY_BANK_KEYWORD in t.merchant:
                     cat_acc = EXP["ETC"]
                     postings += [
-                        Posting(t.txn_uid, t.occurred_at, bank_acc, t.amount, memo),
-                        Posting(t.txn_uid, t.occurred_at, cat_acc, -t.amount, memo),
+                        Posting(t.txn_uid, t.occurred_at, bank_acc, t.amount, item, memo),
+                        Posting(t.txn_uid, t.occurred_at, cat_acc, -t.amount, item, memo),
                     ]
                 elif is_topup_like(t.merchant, t.description):
                     if re.search(r"경기지역화폐", f"{t.merchant} {t.description}"):
@@ -394,81 +438,75 @@ def build_postings(txns: List[StdTxn]) -> List[Posting]:
                     else:
                         wallet = ACCOUNTS["WOORI_CHAEYOUNG"] if t.owner == "chaeyoung" else ACCOUNTS["WOORI_TAEWOO"] # Fallback to other account
                     postings += [
-                        Posting(t.txn_uid, t.occurred_at, bank_acc, t.amount, memo),
-                        Posting(t.txn_uid, t.occurred_at, wallet, -t.amount, memo),
+                        Posting(t.txn_uid, t.occurred_at, bank_acc, t.amount, item, memo),
+                        Posting(t.txn_uid, t.occurred_at, wallet, -t.amount, item, memo),
                     ]
                 else:
                     cat_acc = pick_category(t.merchant, t.description)
                     postings += [
-                        Posting(t.txn_uid, t.occurred_at, bank_acc, t.amount, memo),
-                        Posting(t.txn_uid, t.occurred_at, cat_acc, -t.amount, memo),
+                        Posting(t.txn_uid, t.occurred_at, bank_acc, t.amount, item, memo),
+                        Posting(t.txn_uid, t.occurred_at, cat_acc, abs(t.amount), item, memo),
                     ]
             elif t.amount > 0:
                 postings += [
-                    Posting(t.txn_uid, t.occurred_at, bank_acc, t.amount, memo),
-                    Posting(t.txn_uid, t.occurred_at, INC["INCOME"], -t.amount, memo),
+                    Posting(t.txn_uid, t.occurred_at, bank_acc, t.amount, item, memo),
+                    Posting(t.txn_uid, t.occurred_at, INC["INCOME"], t.amount, item, memo),
                 ]
             else:
                 continue
 
         elif t.source == "card":
-            card_acc = ACCOUNTS["HYUNDAI_CARD"]
+            if t.status == "canceled":
+                continue
+            card_acc = ACCOUNTS["HYUNDAI_CARD_CHAEYOUNG"] if t.owner == "chaeyoung" else ACCOUNTS["HYUNDAI_CARD_TAEWOO"]
 
             if re.search(r"모바일티머니선불형", t.merchant):
                 amt = abs(t.amount)
                 tmoney_acc = ACCOUNTS.get("TMONEY", "현금")
                 postings += [
-                    Posting(t.txn_uid, t.occurred_at, card_acc, amt, memo),
-                    Posting(t.txn_uid, t.occurred_at, tmoney_acc, -amt, memo),
+                    Posting(t.txn_uid, t.occurred_at, card_acc, amt, item, memo),
+                    Posting(t.txn_uid, t.occurred_at, tmoney_acc, amt, item, memo),
                 ]
                 continue
 
-            if t.status == "canceled":
-                cat_acc = pick_category(t.merchant, t.description)
-                postings += [
-                    Posting(t.txn_uid, t.occurred_at, card_acc, -abs(t.amount), memo),
-                    Posting(t.txn_uid, t.occurred_at, cat_acc, abs(t.amount), memo),
-                ]
-            else:
-                cat_acc = pick_category(t.merchant, t.description)
-                postings += [
-                    Posting(t.txn_uid, t.occurred_at, card_acc, abs(t.amount), memo),
-                    Posting(t.txn_uid, t.occurred_at, cat_acc, -abs(t.amount), memo),
-                ]
+            postings += [
+                Posting(t.txn_uid, t.occurred_at, card_acc, abs(t.amount), item, memo),
+                Posting(t.txn_uid, t.occurred_at, cat_acc, abs(t.amount), item, memo),
+            ]
 
         elif t.source == "shinhan":
-            card_acc = ACCOUNTS["SHINHAN_CARD"]
-            
             if t.status == "canceled":
-                cat_acc = pick_category(t.merchant, t.description)
-                postings += [
-                    Posting(t.txn_uid, t.occurred_at, card_acc, -abs(t.amount), memo),
-                    Posting(t.txn_uid, t.occurred_at, cat_acc, abs(t.amount), memo),
-                ]
-            else:
-                cat_acc = pick_category(t.merchant, t.description)
-                postings += [
-                    Posting(t.txn_uid, t.occurred_at, card_acc, abs(t.amount), memo),
-                    Posting(t.txn_uid, t.occurred_at, cat_acc, -abs(t.amount), memo),
-                ]
+                continue
+            card_acc = ACCOUNTS["SHINHAN_CARD_CHAEYOUNG"] if t.owner == "chaeyoung" else ACCOUNTS["SHINHAN_CARD_TAEWOO"]
+            
+            postings += [
+                Posting(t.txn_uid, t.occurred_at, card_acc, abs(t.amount), item, memo),
+                Posting(t.txn_uid, t.occurred_at, cat_acc, abs(t.amount), item, memo),
+            ]
 
         elif t.source == "naverpay":
             points_acc = ACCOUNTS["NAVERPAY_POINTS_TAEWOO"]
             money_acc = ACCOUNTS["NAVERPAY_MONEY_TAEWOO"]
             
             if t.payment_method == "points":
-                # point: 하나의 통장처럼 활용
-                cat_acc = pick_category(t.merchant, t.description)
-                postings += [
-                    Posting(t.txn_uid, t.occurred_at, points_acc, t.amount, memo),
-                    Posting(t.txn_uid, t.occurred_at, cat_acc, -t.amount, memo),
-                ]
+                if t.amount < 0:
+                    # point: 사용 (asset decrease, expense increase)
+                    postings += [
+                        Posting(t.txn_uid, t.occurred_at, points_acc, t.amount, item, memo),
+                        Posting(t.txn_uid, t.occurred_at, cat_acc, abs(t.amount), item, memo),
+                    ]
+                else:
+                    # point: 적립 (asset increase, income increase)
+                    inc_acc = INC["POINT_NAVER"]
+                    postings += [
+                        Posting(t.txn_uid, t.occurred_at, points_acc, t.amount, item, memo),
+                        Posting(t.txn_uid, t.occurred_at, inc_acc, t.amount, item, memo),
+                    ]
             elif t.payment_method == "money":
-                # money: 하나의 통장처럼 활용
-                cat_acc = pick_category(t.merchant, t.description)
+                # money: 사용/충전
                 postings += [
-                    Posting(t.txn_uid, t.occurred_at, money_acc, t.amount, memo),
-                    Posting(t.txn_uid, t.occurred_at, cat_acc, -t.amount, memo),
+                    Posting(t.txn_uid, t.occurred_at, money_acc, t.amount, item, memo),
+                    Posting(t.txn_uid, t.occurred_at, cat_acc, abs(t.amount), item, memo),
                 ]
             else:
                 continue
@@ -479,28 +517,28 @@ def build_postings(txns: List[StdTxn]) -> List[Posting]:
 
             if t.payment_method == "topup":
                 postings += [
-                    Posting(t.txn_uid, t.occurred_at, wallet, t.amount, memo),
-                    Posting(t.txn_uid, t.occurred_at, ACCOUNTS["EXTERNAL"], -t.amount, memo),
+                    Posting(t.txn_uid, t.occurred_at, wallet, t.amount, item, memo),
+                    Posting(t.txn_uid, t.occurred_at, ACCOUNTS["EXTERNAL"], -t.amount, item, memo),
                 ]
             elif t.payment_method == "incentive":
                 # Tori incentive: wallet receives bonus from income
                 postings += [
-                    Posting(t.txn_uid, t.occurred_at, wallet, t.amount, memo),
-                    Posting(t.txn_uid, t.occurred_at, INC["INCOME"], -t.amount, memo),
+                    Posting(t.txn_uid, t.occurred_at, wallet, t.amount, item, memo),
+                    Posting(t.txn_uid, t.occurred_at, INC["INCOME"], -t.amount, item, memo),
                 ]
             else:
                 cat_acc = pick_category(t.merchant, t.description)
                 postings += [
-                    Posting(t.txn_uid, t.occurred_at, wallet, t.amount, memo),
-                    Posting(t.txn_uid, t.occurred_at, cat_acc, -t.amount, memo),
+                    Posting(t.txn_uid, t.occurred_at, wallet, t.amount, item, memo),
+                    Posting(t.txn_uid, t.occurred_at, cat_acc, -t.amount, item, memo),
                 ]
 
         elif t.source == "corp_card":
             card_acc = ACCOUNTS["CORP_CARD"]
             cat_acc = pick_category(t.merchant, t.description)
             postings += [
-                Posting(t.txn_uid, t.occurred_at, card_acc, abs(t.amount), memo),
-                Posting(t.txn_uid, t.occurred_at, cat_acc, -abs(t.amount), memo),
+                Posting(t.txn_uid, t.occurred_at, card_acc, abs(t.amount), item, memo),
+                Posting(t.txn_uid, t.occurred_at, cat_acc, -abs(t.amount), item, memo),
             ]
 
         elif t.source == "onnuri":
@@ -508,15 +546,15 @@ def build_postings(txns: List[StdTxn]) -> List[Posting]:
             
             if t.payment_method == "incentive":
                 postings += [
-                    Posting(t.txn_uid, t.occurred_at, onnuri_acc, t.amount, memo),
-                    Posting(t.txn_uid, t.occurred_at, INC["INCOME"], -t.amount, memo),
+                    Posting(t.txn_uid, t.occurred_at, onnuri_acc, t.amount, item, memo),
+                    Posting(t.txn_uid, t.occurred_at, INC["INCOME"], -t.amount, item, memo),
                 ]
             else:
                 cat_acc = pick_category(t.merchant, t.description)
                 amt = abs(t.amount)
                 postings += [
-                    Posting(t.txn_uid, t.occurred_at, cat_acc, amt, memo),
-                    Posting(t.txn_uid, t.occurred_at, onnuri_acc, -amt, memo),
+                    Posting(t.txn_uid, t.occurred_at, cat_acc, amt, item, memo),
+                    Posting(t.txn_uid, t.occurred_at, onnuri_acc, -amt, item, memo),
                 ]
 
         elif t.source == "transfer":
@@ -531,16 +569,16 @@ def build_postings(txns: List[StdTxn]) -> List[Posting]:
                     to_bank = ACCOUNTS["WOORI_TAEWOO"] if to_owner == "taewoo" else ACCOUNTS["WOORI_CHAEYOUNG"]
                     # from_bank decreases (negative), to_bank increases (positive)
                     postings += [
-                        Posting(t.txn_uid, t.occurred_at, to_bank, abs(t.amount), memo),  # Left: receiving account increases
-                        Posting(t.txn_uid, t.occurred_at, from_bank, t.amount, memo),  # Right: sending account decreases
+                        Posting(t.txn_uid, t.occurred_at, to_bank, abs(t.amount), item, memo),  # Left: receiving account increases
+                        Posting(t.txn_uid, t.occurred_at, from_bank, t.amount, item, memo),  # Right: sending account decreases
                     ]
                 else:
                     # Fallback: use owner to determine
                     from_bank = ACCOUNTS["WOORI_TAEWOO"] if t.owner == "taewoo" else ACCOUNTS["WOORI_CHAEYOUNG"]
                     to_bank = ACCOUNTS["WOORI_CHAEYOUNG"] if t.owner == "taewoo" else ACCOUNTS["WOORI_TAEWOO"]
                     postings += [
-                        Posting(t.txn_uid, t.occurred_at, to_bank, abs(t.amount), memo),
-                        Posting(t.txn_uid, t.occurred_at, from_bank, t.amount, memo),
+                        Posting(t.txn_uid, t.occurred_at, to_bank, abs(t.amount), item, memo),
+                        Posting(t.txn_uid, t.occurred_at, from_bank, t.amount, item, memo),
                     ]
             else:
                 # Other transfers (bank to naver_money, bank to tori, etc.)
@@ -560,8 +598,8 @@ def build_postings(txns: List[StdTxn]) -> List[Posting]:
                     dest_acc = ACCOUNTS["WOORI_CHAEYOUNG"] if t.owner == "taewoo" else ACCOUNTS["WOORI_TAEWOO"]
                 
                 postings += [
-                    Posting(t.txn_uid, t.occurred_at, dest_acc, abs(t.amount), memo),  # Left: destination account increases
-                    Posting(t.txn_uid, t.occurred_at, bank_acc, t.amount, memo),  # Right: source account decreases
+                    Posting(t.txn_uid, t.occurred_at, dest_acc, abs(t.amount), item, memo),  # Left: destination account increases
+                    Posting(t.txn_uid, t.occurred_at, bank_acc, t.amount, item, memo),  # Right: source account decreases
                 ]
 
     return postings
@@ -835,26 +873,28 @@ def build_whooing_rows(postings: List[Posting], config: Dict[str, str] = None) -
         for p in ps:
             acc_type = config.get(p.account, "자산")
             
+            # SIDE ASSIGNMENT RULES (Increase is Positive)
             if acc_type == "비용":
-                left_cand.append(p)
+                if p.amount >= 0: left_cand.append(p)  # Expense Increase -> Left
+                else: right_cand.append(p)            # Expense Decrease -> Right
             elif acc_type == "수익":
-                right_cand.append(p)
+                if p.amount >= 0: right_cand.append(p) # Income Increase -> Right
+                else: left_cand.append(p)             # Income Decrease -> Left
             elif acc_type in ("자산", "부채", "순자산"):
-                # For balance sheet items, side depends on increase/decrease
-                if p.amount > 0:
-                    left_cand.append(p)
-                else:
-                    right_cand.append(p)
+                if acc_type == "자산":
+                    if p.amount >= 0: left_cand.append(p) # Asset Increase -> Left
+                    else: right_cand.append(p)           # Asset Decrease -> Right
+                else: # 부채, 순자산
+                    if p.amount >= 0: right_cand.append(p) # Liability Increase -> Right
+                    else: left_cand.append(p)             # Liability Decrease -> Left
             else:
                 # Default behavior
-                if p.amount > 0: left_cand.append(p)
+                if p.amount >= 0: left_cand.append(p)
                 else: right_cand.append(p)
         
         # We need at least one on each side to create a valid Whooing row.
         # Most transactions are 1:1. For 1:N or N:1 we can generate multiple rows.
         if not left_cand or not right_cand:
-            # Maybe the signs were flipped or categories are both restricted to one side.
-            # This can happen if internal transfer logic is wrong.
             continue
             
         # Match them up. Simple N:M product for now or just zip.
@@ -866,7 +906,7 @@ def build_whooing_rows(postings: List[Posting], config: Dict[str, str] = None) -
             
             rows.append({
                 "날짜": l.occurred_at.strftime("%Y-%m-%d"),
-                "아이템": l.memo.split('/')[-1].split(' ')[0], 
+                "아이템": l.item, 
                 "금액": abs(l.amount),
                 "왼쪽": l.account,
                 "오른쪽": r.account,
@@ -921,7 +961,7 @@ def main() -> None:
         elif kind == "card":
             current_rows = hyundai_card.parse(path, None)  # Card parser determines owner from card number
         elif kind == "shinhan":
-            current_rows = shinhan_card.parse(path, None)  # Card parser determines owner from card number
+            current_rows = shinhan_card.parse(path, owner)
         elif kind == "corp_card":
             current_rows = corp_card.parse(path, owner)
         elif kind == "gcpay":
